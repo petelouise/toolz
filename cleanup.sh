@@ -9,17 +9,22 @@ LOG_FILE=""
 PROFILE="safe"
 DRY_RUN=1
 ASSUME_YES=0
+INTERACTIVE=0
+STRICT_MODE=1
 INCLUDE_VOLUMES=0
 INCLUDE_GLOBAL_CACHES=0
 ONLY_CSV=""
 SKIP_CSV=""
-INTERACTIVE=0
 
 STATUS_LINES=()
 START_TS="$(date '+%Y-%m-%d %H:%M:%S')"
 TOTAL_ESTIMATED_BYTES=0
 START_FREE_BYTES=0
 END_FREE_BYTES=0
+RUN_FAILED=0
+TASK_HAD_FAILURE=0
+CURRENT_TASK_EST_BYTES=0
+CURRENT_TASK_ACTUAL_BYTES=0
 
 print_usage() {
   cat <<'USAGE'
@@ -33,6 +38,8 @@ Options:
   --apply                          Execute commands
   --yes                            Skip confirmation prompt for apply mode
   --interactive                    Ask before risky operations
+  --strict                         Stop on first task with command failures (default)
+  --no-strict                      Continue even if task commands fail
   --include-volumes                Allow Docker volume pruning
   --include-global-caches          Allow global cache removal (Cargo/Go mod cache)
   --only <tasks>                   Comma-separated task list to run
@@ -45,8 +52,8 @@ Tasks:
 Examples:
   ./cleanup.sh
   ./cleanup.sh --apply --yes --profile safe
+  ./cleanup.sh --apply --yes --no-strict --only brew,node
   ./cleanup.sh --apply --yes --profile aggressive --include-volumes --include-global-caches
-  ./cleanup.sh --apply --yes --only docker,node,brew
 USAGE
 }
 
@@ -131,11 +138,105 @@ path_size_bytes() {
   fi
 }
 
+finish() {
+  local exit_code=$?
+  rm -rf "$LOCK_DIR"
+  if [[ $exit_code -eq 0 ]]; then
+    log "Cleanup run completed."
+  else
+    log "Cleanup run failed with exit code $exit_code."
+  fi
+}
+
+acquire_lock() {
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "Another cleanup run appears to be active: $LOCK_DIR" >&2
+    exit 1
+  fi
+  trap finish EXIT
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+should_run_task() {
+  local task="$1"
+  if [[ -n "$ONLY_CSV" && ",$ONLY_CSV," != *",$task,"* ]]; then
+    return 1
+  fi
+  if [[ -n "$SKIP_CSV" && ",$SKIP_CSV," == *",$task,"* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+confirm_apply() {
+  if [[ $DRY_RUN -eq 1 || $ASSUME_YES -eq 1 ]]; then
+    return 0
+  fi
+  echo "About to run cleanup in apply mode. Continue? [y/N]"
+  read -r answer
+  [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+confirm_risky() {
+  local prompt="$1"
+  if [[ $INTERACTIVE -eq 0 || $ASSUME_YES -eq 1 ]]; then
+    return 0
+  fi
+  echo "$prompt [y/N]"
+  read -r answer
+  [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+run_cmd() {
+  local desc="$1"
+  shift
+  local cmd=("$@")
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "[DRY-RUN] $desc"
+    log "[DRY-RUN]   ${cmd[*]}"
+    return 0
+  fi
+
+  log "[RUN] $desc"
+  if "${cmd[@]}"; then
+    return 0
+  fi
+
+  log "[WARN] Command failed: ${cmd[*]}"
+  TASK_HAD_FAILURE=1
+  return 1
+}
+
+append_status() {
+  local task="$1"
+  local status="$2"
+  local note="$3"
+  STATUS_LINES+=("${task}"$'\t'"${status}"$'\t'"${note}"$'\t'"${CURRENT_TASK_EST_BYTES}"$'\t'"${CURRENT_TASK_ACTUAL_BYTES}")
+}
+
+set_status_actual_and_failures() {
+  local from_index="$1"
+  local actual_bytes="$2"
+  local i
+  local task status note est _
+
+  for ((i = from_index; i < ${#STATUS_LINES[@]}; i++)); do
+    IFS=$'\t' read -r task status note est _ <<<"${STATUS_LINES[$i]}"
+    if [[ $TASK_HAD_FAILURE -eq 1 && "$status" == "OK" ]]; then
+      status="FAIL"
+      note="${note} (one or more commands failed)"
+    fi
+    STATUS_LINES[$i]="${task}"$'\t'"${status}"$'\t'"${note}"$'\t'"${est}"$'\t'"${actual_bytes}"
+  done
+}
+
 estimate_docker_reclaimable_bytes() {
   local total=0
-  local line
-  local token
-  local bytes
+  local line token bytes
 
   if ! require_cmd docker; then
     echo 0
@@ -154,8 +255,7 @@ estimate_docker_reclaimable_bytes() {
 estimate_task_bytes() {
   local task="$1"
   local est=0
-  local p
-  local b
+  local p=""
 
   case "$task" in
     docker)
@@ -202,12 +302,10 @@ estimate_task_bytes() {
       fi
       ;;
     xcode)
-      p="${HOME}/Library/Developer/Xcode/DerivedData"
-      est=$((est + $(path_size_bytes "$p")))
+      est=$((est + $(path_size_bytes "${HOME}/Library/Developer/Xcode/DerivedData")))
       ;;
     gradle)
-      p="${HOME}/.gradle/caches"
-      est=$((est + $(path_size_bytes "$p")))
+      est=$((est + $(path_size_bytes "${HOME}/.gradle/caches")))
       ;;
     cargo)
       if [[ $INCLUDE_GLOBAL_CACHES -eq 1 || "$PROFILE" == "aggressive" ]]; then
@@ -223,94 +321,10 @@ estimate_task_bytes() {
       ;;
   esac
 
-  # Avoid negative/empty values from command edge cases.
   if [[ -z "$est" || "$est" -lt 0 ]]; then
     est=0
   fi
   echo "$est"
-}
-
-finish() {
-  local exit_code=$?
-  rm -rf "$LOCK_DIR"
-  if [[ $exit_code -eq 0 ]]; then
-    log "Cleanup run completed."
-  else
-    log "Cleanup run failed with exit code $exit_code."
-  fi
-}
-
-acquire_lock() {
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo "Another cleanup run appears to be active: $LOCK_DIR" >&2
-    exit 1
-  fi
-  trap finish EXIT
-}
-
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1
-}
-
-should_run_task() {
-  local task="$1"
-  if [[ -n "$ONLY_CSV" ]]; then
-    if [[ ",$ONLY_CSV," != *",$task,"* ]]; then
-      return 1
-    fi
-  fi
-  if [[ -n "$SKIP_CSV" ]]; then
-    if [[ ",$SKIP_CSV," == *",$task,"* ]]; then
-      return 1
-    fi
-  fi
-  return 0
-}
-
-confirm_apply() {
-  if [[ $DRY_RUN -eq 1 || $ASSUME_YES -eq 1 ]]; then
-    return 0
-  fi
-  echo "About to run cleanup in apply mode. Continue? [y/N]"
-  read -r answer
-  [[ "$answer" =~ ^[Yy]$ ]]
-}
-
-confirm_risky() {
-  local prompt="$1"
-  if [[ $INTERACTIVE -eq 0 || $ASSUME_YES -eq 1 ]]; then
-    return 0
-  fi
-  echo "$prompt [y/N]"
-  read -r answer
-  [[ "$answer" =~ ^[Yy]$ ]]
-}
-
-run_cmd() {
-  local desc="$1"
-  shift
-  local cmd=("$@")
-
-  if [[ $DRY_RUN -eq 1 ]]; then
-    log "[DRY-RUN] $desc"
-    log "[DRY-RUN]   ${cmd[*]}"
-    return 0
-  fi
-
-  log "[RUN] $desc"
-  if "${cmd[@]}"; then
-    return 0
-  fi
-
-  log "[WARN] Command failed: ${cmd[*]}"
-  return 1
-}
-
-append_status() {
-  local task="$1"
-  local status="$2"
-  local note="$3"
-  STATUS_LINES+=("$(printf '%-10s %-8s %s' "$task" "$status" "$note")")
 }
 
 cleanup_docker() {
@@ -491,13 +505,26 @@ cleanup_cargo() {
 
 run_task() {
   local task="$1"
+  local start_index=0
   local estimated=0
+  local start_task_free=0
+  local end_task_free=0
+
   if ! should_run_task "$task"; then
-    return
+    return 0
   fi
 
+  TASK_HAD_FAILURE=0
+  CURRENT_TASK_ACTUAL_BYTES=0
+  start_index="${#STATUS_LINES[@]}"
+
   estimated="$(estimate_task_bytes "$task")"
+  CURRENT_TASK_EST_BYTES="$estimated"
   TOTAL_ESTIMATED_BYTES=$((TOTAL_ESTIMATED_BYTES + estimated))
+
+  if [[ $DRY_RUN -eq 0 ]]; then
+    start_task_free="$(free_bytes)"
+  fi
 
   case "$task" in
     docker) cleanup_docker ;;
@@ -512,6 +539,25 @@ run_task() {
     cargo) cleanup_cargo ;;
     *) log "[WARN] Unknown task: $task" ;;
   esac
+
+  if [[ $DRY_RUN -eq 0 ]]; then
+    end_task_free="$(free_bytes)"
+    if [[ "$end_task_free" -gt "$start_task_free" ]]; then
+      CURRENT_TASK_ACTUAL_BYTES="$((end_task_free - start_task_free))"
+    fi
+  fi
+
+  if [[ "${#STATUS_LINES[@]}" -gt "$start_index" ]]; then
+    set_status_actual_and_failures "$start_index" "$CURRENT_TASK_ACTUAL_BYTES"
+  fi
+
+  if [[ $TASK_HAD_FAILURE -eq 1 && $STRICT_MODE -eq 1 ]]; then
+    log "[ERROR] Strict mode stopping on failed task: $task"
+    RUN_FAILED=1
+    return 1
+  fi
+
+  return 0
 }
 
 parse_args() {
@@ -535,6 +581,14 @@ parse_args() {
         ;;
       --interactive)
         INTERACTIVE=1
+        shift
+        ;;
+      --strict)
+        STRICT_MODE=1
+        shift
+        ;;
+      --no-strict)
+        STRICT_MODE=0
         shift
         ;;
       --include-volumes)
@@ -580,7 +634,7 @@ main() {
   acquire_lock
 
   log "Cleanup run started at $START_TS"
-  log "Settings: profile=$PROFILE dry_run=$DRY_RUN yes=$ASSUME_YES only=${ONLY_CSV:-all} skip=${SKIP_CSV:-none}"
+  log "Settings: profile=$PROFILE dry_run=$DRY_RUN yes=$ASSUME_YES strict=$STRICT_MODE only=${ONLY_CSV:-all} skip=${SKIP_CSV:-none}"
   START_FREE_BYTES="$(free_bytes)"
 
   if [[ $DRY_RUN -eq 0 ]] && ! confirm_apply; then
@@ -600,15 +654,23 @@ main() {
 
   local task
   for task in "${tasks[@]}"; do
-    run_task "$task"
+    if ! run_task "$task"; then
+      break
+    fi
   done
 
   log "Summary:"
-  log "task       status   note"
-  log "---------- -------- -----------------------------------------"
+  log "task       status   estimated    reclaimed    note"
+  log "---------- -------- ------------ ------------ -----------------------------------------"
 
-  for task in "${STATUS_LINES[@]}"; do
-    log "$task"
+  local line row_task row_status row_note row_est row_actual
+  for line in "${STATUS_LINES[@]}"; do
+    IFS=$'\t' read -r row_task row_status row_note row_est row_actual <<<"$line"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log "$(printf '%-10s %-8s %-12s %-12s %s' "$row_task" "$row_status" "$(human_bytes "$row_est")" "n/a" "$row_note")"
+    else
+      log "$(printf '%-10s %-8s %-12s %-12s %s' "$row_task" "$row_status" "$(human_bytes "$row_est")" "$(human_bytes "$row_actual")" "$row_note")"
+    fi
   done
 
   if [[ $DRY_RUN -eq 1 ]]; then
@@ -623,6 +685,10 @@ main() {
   fi
 
   log "Tip: schedule with launchd using '--apply --yes --profile safe'."
+
+  if [[ $RUN_FAILED -eq 1 ]]; then
+    exit 1
+  fi
 }
 
 main "$@"
