@@ -131,23 +131,15 @@ if [[ "${#MATCHES[@]}" -eq 0 ]]; then
 fi
 
 # Compute total KB and keep per-path KB for later reporting.
-readarray -t SIZES < <(python3 - <<'PY' "${MATCHES[@]}"
-import subprocess, sys
-paths = sys.argv[1:]
-for p in paths:
-    try:
-        out = subprocess.check_output(["du","-sk",p], stderr=subprocess.DEVNULL).decode().strip()
-        kb = int(out.split()[0])
-        print(f"{kb}\t{p}")
-    except Exception:
-        # If du fails (permissions/races), treat as 0 and still list it.
-        print(f"0\t{p}")
-PY
-)
-
+SIZES=()
 TOTAL_KB=0
-for line in "${SIZES[@]}"; do
-  kb="${line%%$'\t'*}"
+for p in "${MATCHES[@]}"; do
+  kb=0
+  if out="$(du -sk -- "$p" 2>/dev/null)"; then
+    kb="${out%%[[:space:]]*}"
+    [[ "$kb" =~ ^[0-9]+$ ]] || kb=0
+  fi
+  SIZES+=("${kb}"$'\t'"${p}")
   TOTAL_KB=$((TOTAL_KB + kb))
 done
 
@@ -180,27 +172,11 @@ echo "Estimated reclaimable space: $TOTAL_HUMAN"
 echo
 echo "Largest candidates:"
 # show top 30 by KB, descending
-python3 - <<'PY' "${SIZES[@]}" | head -n 30
-import sys
-rows = []
-for line in sys.argv[1:]:
-    kb_s, path = line.split("\t", 1)
-    kb = int(kb_s)
-    rows.append((kb, path))
-rows.sort(reverse=True)
-def human(kb):
-    b = kb*1024
-    units=["B","KB","MB","GB","TB"]
-    u=0
-    v=float(b)
-    while v>=1024 and u<len(units)-1:
-        v/=1024; u+=1
-    if u==0: return f"{int(v)} {units[u]}"
-    if u in (1,2): return f"{v:.1f} {units[u]}"
-    return f"{v:.2f} {units[u]}"
-for kb, p in rows:
-    print(f"{human(kb):>10}  {p}")
-PY
+if [[ "${#SIZES[@]}" -gt 0 ]]; then
+  while IFS=$'\t' read -r kb p; do
+    printf "%10s  %s\n" "$(human_kb "$kb")" "$p"
+  done < <(printf '%s\n' "${SIZES[@]}" | sort -nr -k1,1 | head -n 30)
+fi
 echo
 
 if [[ "$APPLY" -eq 0 ]]; then
